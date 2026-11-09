@@ -1,551 +1,616 @@
-/* =====================================================================
-   LC79 MD5 PREDICTOR - FULL SYSTEM v3.0
-   Single-file backend: fetch + analyze + predict + storage + API + HTML
-   ===================================================================== */
+/* ================================================================
+   ██╗   ██╗██╗██████╗     ████████╗██╗  ██╗███╗   ███╗██████╗ ███████╗
+   ██║   ██║██║██╔══██╗    ╚══██╔══╝╚██╗██╔╝████╗ ████║██╔══██╗██╔════╝
+   ██║   ██║██║██████╔╝       ██║    ╚███╔╝ ██╔████╔██║██║  ██║███████╗
+   ╚██╗ ██╔╝██║██╔═══╝        ██║    ██╔██╗ ██║╚██╔╝██║██║  ██║╚════██║
+    ╚████╔╝ ██║██║            ██║   ██╔╝ ██╗██║ ╚═╝ ██║██████╔╝███████║
+     ╚═══╝  ╚═╝╚═╝            ╚═╝   ╚═╝  ╚═╝╚═╝     ╚═╝╚═════╝ ╚══════╝
+   LC79 · TREO RENDER · BỆT/KÉP/THEO/BẺ · FULL VERSION
+   ================================================================ */
+(function () {
+  'use strict';
 
-const express = require('express');
-const axios = require('axios');
-const cron = require('node-cron');
+  /* ============================================================
+     [1] CONFIG
+     ============================================================ */
+  const CFG = {
+    API: 'https://wtxmd52.macminim6.online/v1/txmd5/sessions',
+    REFRESH_MS: 5000,
+    MAX_LOG: 80,
+    STORAGE_KEY: '__vip_txmd5_state__',
+    SOUND_ON: true,
+    DEBUG: false
+  };
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+  /* ============================================================
+     [2] STATE
+     ============================================================ */
+  const S = {
+    pred: null,
+    log: [],
+    fetches: 0,
+    errors: 0,
+    timerFetch: null,
+    timerCd: null,
+    cd: CFG.REFRESH_MS / 1000,
+    lastList: [],
+    streakStats: { maxXiu: 0, maxTai: 0, currentXiu: 0, currentTai: 0 },
+    startTime: Date.now()
+  };
 
-/* ============================ CONFIG ============================ */
-const CONFIG = {
-  API_GOC: 'https://wtxmd52.tele68.com/v1/txmd5/sessions',
-  CRON: '*/5 * * * * *',
-  MAX_HISTORY: 3000,
-  MAX_PREDICTIONS: 1500,
-  MIN_CONFIDENCE: 55,
-  WEIGHTS: {
-    streakBreak: 5,
-    streakFollow: 2,
-    longStreakFade: 6,
-    balanceRatio: 3,
-    pattern222: 4,
-    pattern1212: 2,
-    pattern3step: 3,
-    recentTrend: 3,
-    diceBias: 2,
-    pointBias: 2,
-    bouncePattern: 3,
-    clusterDensity: 2,
-    alternatingFade: 3,
-    doubleBreak: 4
+  /* ============================================================
+     [3] UTILS
+     ============================================================ */
+  const $ = (id) => document.getElementById(id);
+  const now = () => Date.now();
+  const fmtTime = () => new Date().toLocaleTimeString('vi-VN');
+
+  function log(...args) {
+    if (CFG.DEBUG) console.log('%c[TXMD5]', 'color:#4ecdc4', ...args);
   }
-};
 
-/* ============================ LOGGER ============================ */
-const logger = {
-  log: (...a) => console.log(`[${new Date().toISOString()}]`, ...a),
-  info: (...a) => console.log(`[INFO ${new Date().toISOString()}]`, ...a),
-  warn: (...a) => console.warn(`[WARN ${new Date().toISOString()}]`, ...a),
-  error: (...a) => console.error(`[ERR  ${new Date().toISOString()}]`, ...a)
-};
+  function saveState() {
+    try {
+      localStorage.setItem(CFG.STORAGE_KEY, JSON.stringify({
+        log: S.log.slice(0, 40),
+        streakStats: S.streakStats
+      }));
+    } catch (e) { /* ignore */ }
+  }
 
-/* ============================ STORAGE ============================ */
-const Store = {
-  history: [],       // mới → cũ
-  predictions: [],   // mới → cũ
-  lastId: null,
-  fetchCount: 0,
-  errorCount: 0,
-  startTime: Date.now(),
-  lastFetchAt: null,
-  apiLatency: 0
-};
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(CFG.STORAGE_KEY);
+      if (!raw) return;
+      const d = JSON.parse(raw);
+      if (d.log && Array.isArray(d.log)) S.log = d.log;
+      if (d.streakStats) S.streakStats = d.streakStats;
+    } catch (e) { /* ignore */ }
+  }
 
-/* ============================ FETCHER ============================ */
-let isFetching = false;
+  /* ============================================================
+     [4] SOUND
+     ============================================================ */
+  function beep(freq = 880, dur = 120) {
+    if (!CFG.SOUND_ON) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      const ctx = new AC();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = freq;
+      osc.type = 'sine';
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      gain.gain.setValueAtTime(0.08, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur / 1000);
+      osc.start();
+      osc.stop(ctx.currentTime + dur / 1000);
+    } catch (e) { /* ignore */ }
+  }
 
-async function fetchSessions() {
-  if (isFetching) return null;
-  isFetching = true;
-  const t0 = Date.now();
-  try {
-    const res = await axios.get(CONFIG.API_GOC, {
-      timeout: 12000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 LC79Predictor/3.0',
-        'Accept': 'application/json'
+  /* ============================================================
+     [5] PATTERN ENGINE - PHÂN TÍCH CẦU CHUYÊN SÂU
+     ============================================================ */
+  const Pattern = {
+    getSeq(list) {
+      return list.map(x => x.resultTruyenThong);
+    },
+
+    getStreak(seq) {
+      let streak = 1;
+      for (let i = 1; i < seq.length; i++) {
+        if (seq[i] === seq[0]) streak++;
+        else break;
+      }
+      return streak;
+    },
+
+    countChanges(seq, n = 10) {
+      const s = seq.slice(0, n);
+      let c = 0;
+      for (let i = 1; i < s.length; i++) {
+        if (s[i] !== s[i - 1]) c++;
+      }
+      return c;
+    },
+
+    isKep(seq) {
+      if (seq.length < 6) return false;
+      return seq[0] === seq[1] && seq[2] === seq[3] &&
+             seq[4] === seq[5] && seq[0] !== seq[2] && seq[2] !== seq[4];
+    },
+
+    isKep3(seq) {
+      if (seq.length < 9) return false;
+      return seq[0] === seq[1] && seq[1] === seq[2] &&
+             seq[3] === seq[4] && seq[4] === seq[5] &&
+             seq[6] === seq[7] && seq[7] === seq[8];
+    },
+
+    isTheo(seq, n = 10) {
+      return this.countChanges(seq, n) >= 7;
+    },
+
+    isBet(seq) {
+      return this.getStreak(seq) >= 3;
+    },
+
+    isDao(seq) {
+      if (seq.length < 4) return false;
+      for (let i = 1; i < 4; i++) {
+        if (seq[i] === seq[i - 1]) return false;
+      }
+      return true;
+    },
+
+    isCau1_1(seq) {
+      if (seq.length < 6) return false;
+      for (let i = 1; i < 6; i++) {
+        if (seq[i] === seq[i - 1]) return false;
+      }
+      return true;
+    },
+
+    isCau2_1(seq) {
+      if (seq.length < 6) return false;
+      const a = seq[0], b = seq[1];
+      if (a === b) return false;
+      return seq[2] === a && seq[3] === b && seq[4] === a && seq[5] === b;
+    },
+
+    isCau3_1(seq) {
+      if (seq.length < 8) return false;
+      const a = seq[0], b = seq[1];
+      if (a === b) return false;
+      return seq[2] === a && seq[3] === b && seq[4] === a && seq[5] === b && seq[6] === a && seq[7] === b;
+    },
+
+    analyze(list) {
+      const seq = this.getSeq(list);
+      const streak = this.getStreak(seq);
+      const changes10 = this.countChanges(seq, 10);
+      const changes5 = this.countChanges(seq, 5);
+
+      const isKep = this.isKep(seq);
+      const isKep3 = this.isKep3(seq);
+      const isTheo = this.isTheo(seq);
+      const isBet = this.isBet(seq);
+      const isDao = this.isDao(seq);
+      const isCau1_1 = this.isCau1_1(seq);
+      const isCau2_1 = this.isCau2_1(seq);
+      const isCau3_1 = this.isCau3_1(seq);
+
+      let pred, method, conf, tags = [];
+
+      if (isBet && streak >= 5) {
+        pred = seq[0] === 'TAI' ? 'XIU' : 'TAI';
+        method = `Bệt ${streak} → BẺ`;
+        conf = 62;
+        tags = ['bet', 'bẻ'];
+      } else if (isBet) {
+        pred = seq[0];
+        method = `Cầu Bệt ${streak}`;
+        conf = streak === 4 ? 55 : 68;
+        tags = ['bet'];
+      } else if (isKep3) {
+        pred = seq[0];
+        method = 'Cầu Kép 3-3';
+        conf = 72;
+        tags = ['kep3'];
+      } else if (isKep) {
+        pred = seq[0];
+        method = 'Cầu Kép 2-2';
+        conf = 68;
+        tags = ['kep'];
+      } else if (isCau3_1) {
+        pred = seq[0];
+        method = 'Cầu 3-1';
+        conf = 70;
+        tags = ['cau31'];
+      } else if (isCau2_1) {
+        pred = seq[0];
+        method = 'Cầu 2-1';
+        conf = 66;
+        tags = ['cau21'];
+      } else if (isCau1_1) {
+        pred = seq[0] === 'TAI' ? 'XIU' : 'TAI';
+        method = 'Cầu 1-1 → BẺ';
+        conf = 64;
+        tags = ['cau11'];
+      } else if (isTheo) {
+        pred = seq[0] === 'TAI' ? 'XIU' : 'TAI';
+        method = 'Cầu Theo → BẺ';
+        conf = 63;
+        tags = ['theo'];
+      } else if (isDao) {
+        pred = seq[0] === 'TAI' ? 'XIU' : 'TAI';
+        method = 'Cầu Đảo 3';
+        conf = 60;
+        tags = ['dao'];
+      } else {
+        pred = seq[0] === 'TAI' ? 'XIU' : 'TAI';
+        method = streak >= 2 ? `Bẻ sau ${streak}` : 'Bẻ cầu ngắn';
+        conf = streak >= 2 ? 58 : 55;
+        tags = ['be'];
+      }
+
+      return {
+        pred, method, conf, tags,
+        streak, changes10, changes5,
+        isKep, isKep3, isTheo, isBet, isDao,
+        isCau1_1, isCau2_1, isCau3_1,
+        seq10: seq.slice(0, 10)
+      };
+    }
+  };
+
+  /* ============================================================
+     [6] CHECK ĐÚNG SAI
+     ============================================================ */
+  function checkPredictions(list) {
+    const map = {};
+    list.forEach(x => map[x.id] = x.resultTruyenThong);
+
+    S.log.forEach(p => {
+      if (map[p.forId] !== undefined) {
+        p.actual = map[p.forId];
+        p.correct = (p.value === p.actual);
       }
     });
-    Store.apiLatency = Date.now() - t0;
-    Store.fetchCount++;
-    Store.lastFetchAt = Date.now();
 
-    if (!res.data || !Array.isArray(res.data.list)) {
-      logger.warn('Invalid payload');
-      return null;
+    const done = S.log.filter(p => p.actual).slice(0, 10);
+    let w = 0, t = 0;
+    done.forEach(p => { t++; if (p.correct) w++; });
+
+    const done20 = S.log.filter(p => p.actual).slice(0, 20);
+    let w20 = 0, t20 = 0;
+    done20.forEach(p => { t20++; if (p.correct) w20++; });
+
+    const totalWin = S.log.filter(p => p.actual && p.correct).length;
+    const totalDone = S.log.filter(p => p.actual).length;
+
+    return {
+      win10: t ? Math.round(w / t * 100) : 0,
+      win20: t20 ? Math.round(w20 / t20 * 100) : 0,
+      totalWin,
+      totalDone,
+      winAll: totalDone ? Math.round(totalWin / totalDone * 100) : 0,
+      count10: { w, t }
+    };
+  }
+
+  /* ============================================================
+     [7] STREAK STATS
+     ============================================================ */
+  function updateStreakStats(list) {
+    const seq = list.map(x => x.resultTruyenThong);
+    let maxX = 0, maxT = 0, curX = 0, curT = 0;
+    for (let i = 0; i < seq.length; i++) {
+      if (seq[i] === 'XIU') { curX++; curT = 0; }
+      else { curT++; curX = 0; }
+      if (curX > maxX) maxX = curX;
+      if (curT > maxT) maxT = curT;
     }
-    const list = res.data.list.slice(0, CONFIG.MAX_HISTORY);
-    Store.history = list;
-    return { list, typeStat: res.data.typeStat || {} };
-  } catch (e) {
-    Store.errorCount++;
-    logger.error('Fetch error:', e.message);
-    return null;
-  } finally {
-    isFetching = false;
-  }
-}
-
-/* ============================ ANALYZER ============================ */
-function analyze(list) {
-  if (!list || !list.length) return null;
-  const results = list.map(x => x.resultTruyenThong);
-  const n = results.length;
-  const last = results[0];
-  const opposite = last === 'TAI' ? 'XIU' : 'TAI';
-
-  // streak
-  let streak = 1;
-  for (let i = 1; i < n; i++) {
-    if (results[i] === last) streak++;
-    else break;
+    S.streakStats = {
+      maxXiu: Math.max(S.streakStats.maxXiu, maxX),
+      maxTai: Math.max(S.streakStats.maxTai, maxT),
+      currentXiu: curX,
+      currentTai: curT
+    };
   }
 
-  // tổng
-  const tai = results.filter(r => r === 'TAI').length;
-  const xiu = results.filter(r => r === 'XIU').length;
-  const total = tai + xiu;
+  /* ============================================================
+     [8] UI BUILD
+     ============================================================ */
+  function initUI() {
+    const old = $('__vip_txmd5__');
+    if (old) old.remove();
 
-  let score = 0;
-  const details = [];
-  const push = (name, delta, reason) => {
-    if (delta === 0) return;
-    score += delta;
-    details.push({ name, delta, reason });
-  };
+    const div = document.createElement('div');
+    div.id = '__vip_txmd5__';
+    div.innerHTML = `
+      <style>
+        #__vip_txmd5__{
+          position:fixed;top:10px;right:10px;z-index:2147483647;
+          width:360px;max-height:94vh;overflow-y:auto;
+          font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+          background:linear-gradient(160deg,#0f0c29,#302b63,#24243e);
+          color:#fff;border-radius:16px;padding:14px;
+          box-shadow:0 10px 50px rgba(0,0,0,.85), 0 0 0 1px rgba(255,255,255,.08);
+          font-size:12px;backdrop-filter:blur(10px);
+        }
+        #__vip_txmd5__::-webkit-scrollbar{width:5px}
+        #__vip_txmd5__::-webkit-scrollbar-thumb{background:#ffd70055;border-radius:5px}
+        #__vip_txmd5__ .vh{text-align:center;margin-bottom:12px;position:relative}
+        #__vip_txmd5__ .vh h1{
+          font-size:16px;letter-spacing:1.5px;font-weight:800;
+          background:linear-gradient(90deg,#ffd700,#ff6b6b,#4ecdc4);
+          -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+          background-clip:text;
+        }
+        #__vip_txmd5__ .vh .s{font-size:9px;color:#777;margin-top:2px}
+        #__vip_txmd5__ .close{
+          position:absolute;top:-2px;right:0;cursor:pointer;
+          font-size:16px;color:#888;line-height:1;
+        }
+        #__vip_txmd5__ .close:hover{color:#ff6b6b}
+        #__vip_txmd5__ .pred{
+          text-align:center;padding:16px 8px;border-radius:14px;
+          margin-bottom:12px;transition:.3s;position:relative;overflow:hidden;
+        }
+        #__vip_txmd5__ .pred.TAI{
+          background:linear-gradient(135deg,#ff416c,#ff4b2b);
+          box-shadow:0 0 30px rgba(255,65,108,.6);
+        }
+        #__vip_txmd5__ .pred.XIU{
+          background:linear-gradient(135deg,#11998e,#38ef7d);
+          box-shadow:0 0 30px rgba(56,239,125,.6);
+        }
+        #__vip_txmd5__ .pred.WAIT{background:linear-gradient(135deg,#444,#222)}
+        #__vip_txmd5__ .pred .l{font-size:10px;opacity:.9;letter-spacing:2.5px}
+        #__vip_txmd5__ .pred .v{
+          font-size:38px;font-weight:900;letter-spacing:4px;margin:4px 0;
+          text-shadow:0 3px 14px rgba(0,0,0,.5);
+        }
+        #__vip_txmd5__ .pred .m{font-size:10px;opacity:.92}
+        #__vip_txmd5__ .tags{
+          display:flex;gap:4px;justify-content:center;flex-wrap:wrap;margin-top:8px;
+        }
+        #__vip_txmd5__ .tag{
+          font-size:8px;padding:2px 7px;border-radius:10px;
+          background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.15);
+          transition:.2s;
+        }
+        #__vip_txmd5__ .tag.on{
+          background:#ffd700;color:#000;font-weight:800;border-color:#ffd700;
+          box-shadow:0 0 10px #ffd70088;
+        }
+        #__vip_txmd5__ .stats{
+          display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-bottom:10px;
+        }
+        #__vip_txmd5__ .st{
+          background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);
+          border-radius:8px;padding:6px 2px;text-align:center;
+        }
+        #__vip_txmd5__ .st .n{font-size:14px;font-weight:800}
+        #__vip_txmd5__ .st .lb{font-size:7px;color:#999;text-transform:uppercase;letter-spacing:.5px}
+        #__vip_txmd5__ .st.g .n{color:#38ef7d}
+        #__vip_txmd5__ .st.r .n{color:#ff6b6b}
+        #__vip_txmd5__ .st.y .n{color:#ffd700}
+        #__vip_txmd5__ .st.b .n{color:#4ecdc4}
+        #__vip_txmd5__ .ht{
+          display:flex;justify-content:space-between;font-size:10px;
+          color:#aaa;margin-bottom:6px;font-weight:600;
+        }
+        #__vip_txmd5__ .hl{
+          display:flex;flex-direction:column;gap:3px;
+          max-height:250px;overflow-y:auto;padding-right:3px;
+        }
+        #__vip_txmd5__ .hl::-webkit-scrollbar{width:4px}
+        #__vip_txmd5__ .hl::-webkit-scrollbar-thumb{background:#ffd70055;border-radius:4px}
+        #__vip_txmd5__ .hi{
+          display:flex;align-items:center;justify-content:space-between;
+          padding:6px 8px;border-radius:7px;font-size:10px;
+          background:rgba(255,255,255,.04);border-left:3px solid transparent;
+          transition:.2s;
+        }
+        #__vip_txmd5__ .hi:hover{background:rgba(255,255,255,.09)}
+        #__vip_txmd5__ .hi.TAI{border-left-color:#ff416c}
+        #__vip_txmd5__ .hi.XIU{border-left-color:#38ef7d}
+        #__vip_txmd5__ .hi .id{color:#666;font-size:8px;min-width:48px}
+        #__vip_txmd5__ .hi .v{font-weight:800;min-width:32px}
+        #__vip_txmd5__ .hi.TAI .v{color:#ff6b6b}
+        #__vip_txmd5__ .hi.XIU .v{color:#38ef7d}
+        #__vip_txmd5__ .hi .m{
+          font-size:8px;color:#888;flex:1;text-align:center;
+          overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 4px;
+        }
+        #__vip_txmd5__ .hi .p{font-size:8px;color:#ffd700;min-width:26px;text-align:right}
+        #__vip_txmd5__ .ck{font-size:12px;min-width:16px;text-align:right;font-weight:700}
+        #__vip_txmd5__ .ck.ok{color:#38ef7d}
+        #__vip_txmd5__ .ck.bad{color:#ff6b6b}
+        #__vip_txmd5__ .ck.wait{color:#777}
+        #__vip_txmd5__ .bar{
+          text-align:center;font-size:8px;color:#666;margin-top:10px;
+          padding-top:8px;border-top:1px solid rgba(255,255,255,.08);
+        }
+        #__vip_txmd5__ .dot{
+          display:inline-block;width:5px;height:5px;border-radius:50%;
+          background:#38ef7d;margin-right:3px;animation:__pl 1.4s infinite;
+        }
+        @keyframes __pl{0%,100%{opacity:1}50%{opacity:.25}}
+        #__vip_txmd5__ .mini-stats{
+          display:flex;justify-content:space-around;margin-bottom:10px;
+          font-size:9px;color:#888;
+        }
+        #__vip_txmd5__ .mini-stats span b{color:#ffd700}
+      </style>
+      <div class="vh">
+        <span class="close" id="__close">✕</span>
+        <h1>⚡ VIP TXMD5 LC79 ⚡</h1>
+        <div class="s">Treo Render · Bệt/Kép/Theo/Bẻ · Full</div>
+      </div>
 
-  // === Rule 1: streak ===
-  if (streak >= 2 && streak <= 4) {
-    const d = (last === 'TAI' ? -1 : 1) * CONFIG.WEIGHTS.streakBreak;
-    push('streakBreak', d, `Bẻ cầu sau ${streak} phiên ${last}`);
-  } else if (streak === 1) {
-    const d = (last === 'TAI' ? 1 : -1) * CONFIG.WEIGHTS.streakFollow;
-    push('streakFollow', d, 'Theo cầu nhẹ');
-  } else if (streak >= 5) {
-    const d = (last === 'TAI' ? -1 : 1) * CONFIG.WEIGHTS.longStreakFade;
-    push('longStreakFade', d, `Chuỗi ${streak} phiên → hồi`);
+      <div id="__pred" class="pred WAIT">
+        <div class="l">DỰ ĐOÁN</div>
+        <div class="v" id="__pv">...</div>
+        <div class="m" id="__pm">Đang kết nối...</div>
+        <div class="tags" id="__pt"></div>
+      </div>
+
+      <div class="stats">
+        <div class="st y"><div class="n" id="__sT">0</div><div class="lb">Tổng</div></div>
+        <div class="st g"><div class="n" id="__sX">0</div><div class="lb">Xỉu</div></div>
+        <div class="st r"><div class="n" id="__sA">0</div><div class="lb">Tài</div></div>
+        <div class="st b"><div class="n" id="__sW">0%</div><div class="lb">Win10</div></div>
+      </div>
+
+      <div class="mini-stats">
+        <span>Win20: <b id="__w20">0%</b></span>
+        <span>All: <b id="__wAll">0%</b></span>
+        <span>Max X: <b id="__mX">0</b></span>
+        <span>Max T: <b id="__mT">0</b></span>
+      </div>
+
+      <div class="ht">
+        <span>📜 Check đúng/sai</span>
+        <span id="__ut">--</span>
+      </div>
+      <div class="hl" id="__hl"></div>
+
+      <div class="bar">
+        <span class="dot"></span> Auto 5s · <span id="__cd">5</span>s
+        · <span id="__fc">0</span> fetch
+        · <span id="__er">0</span> err
+      </div>
+    `;
+    document.body.appendChild(div);
+
+    $('__close').onclick = () => {
+      div.remove();
+      if (S.timerFetch) clearInterval(S.timerFetch);
+      if (S.timerCd) clearInterval(S.timerCd);
+    };
   }
 
-  // === Rule 2: balance ===
-  const imbalance = (tai - xiu) / total;
-  if (Math.abs(imbalance) > 0.15) {
-    const d = imbalance > 0 ? -CONFIG.WEIGHTS.balanceRatio : CONFIG.WEIGHTS.balanceRatio;
-    push('balanceRatio', d, `Lệch ${(imbalance*100).toFixed(1)}%`);
+  /* ============================================================
+     [9] RENDER
+     ============================================================ */
+  function render(data) {
+    if (!data || !data.list || !data.list.length) return;
+
+    const list = data.list;
+    S.lastList = list;
+
+    const latest = list[0];
+    const nextId = latest.id + 1;
+    const pat = Pattern.analyze(list);
+
+    if (!S.pred || S.pred.forId !== nextId) {
+      S.pred = {
+        forId: nextId,
+        value: pat.pred,
+        method: pat.method,
+        confidence: pat.conf,
+        tags: pat.tags,
+        ts: now()
+      };
+      S.log.unshift({ ...S.pred });
+      if (S.log.length > CFG.MAX_LOG) S.log.pop();
+      saveState();
+      beep(880, 100);
+    }
+
+    updateStreakStats(list);
+    const ck = checkPredictions(list);
+
+    const box = $('__pred');
+    if (box) {
+      box.className = 'pred ' + S.pred.value;
+      $('__pv').textContent = S.pred.value;
+      $('__pm').textContent = `#${nextId} · ${S.pred.method} · ${S.pred.confidence}%`;
+
+      const tagDefs = [
+        { k: 'bet', l: `Bệt ${pat.streak}`, on: pat.isBet },
+        { k: 'kep', l: 'Kép 2-2', on: pat.isKep },
+        { k: 'kep3', l: 'Kép 3-3', on: pat.isKep3 },
+        { k: 'theo', l: 'Theo', on: pat.isTheo },
+        { k: 'cau11', l: '1-1', on: pat.isCau1_1 },
+        { k: 'cau21', l: '2-1', on: pat.isCau2_1 },
+        { k: 'dao', l: 'Đảo', on: pat.isDao },
+        { k: 'be', l: `Bẻ ${pat.changes10}/10`, on: pat.changes10 >= 5 }
+      ];
+      $('__pt').innerHTML = tagDefs
+        .map(t => `<span class="tag ${t.on ? 'on' : ''}">${t.l}</span>`)
+        .join('');
+    }
+
+    const ts = data.typeStat || { XIU: 0, TAI: 0 };
+    $('__sT').textContent = list.length;
+    $('__sX').textContent = ts.XIU;
+    $('__sA').textContent = ts.TAI;
+    $('__sW').textContent = ck.win10 + '%';
+    $('__w20').textContent = ck.win20 + '%';
+    $('__wAll').textContent = ck.winAll + '%';
+    $('__mX').textContent = S.streakStats.maxXiu;
+    $('__mT').textContent = S.streakStats.maxTai;
+
+    $('__hl').innerHTML = S.log.slice(0, 30).map(p => {
+      let ckHtml = '<span class="ck wait">⏳</span>';
+      if (p.actual) ckHtml = p.correct
+        ? '<span class="ck ok">✔</span>'
+        : '<span class="ck bad">✘</span>';
+      return `<div class="hi ${p.value}">
+        <span class="id">#${p.forId}</span>
+        <span class="v">${p.value}</span>
+        <span class="m">${p.method}</span>
+        <span class="p">${p.confidence}%</span>
+        ${ckHtml}
+      </div>`;
+    }).join('');
+
+    $('__ut').textContent = fmtTime();
+    $('__fc').textContent = S.fetches;
+    $('__er').textContent = S.errors;
+
+    // thông báo khi có kết quả mới (check)
+    if (ck.totalDone > (S._lastDone || 0)) {
+      S._lastDone = ck.totalDone;
+      const lastChecked = S.log.find(p => p.actual);
+      if (lastChecked) {
+        beep(lastChecked.correct ? 1200 : 300, lastChecked.correct ? 100 : 200);
+      }
+    }
+
+    log('Rendered', { nextId, pred: S.pred.value, win10: ck.win10 });
   }
 
-  // === Rule 3: 2-2-2 ===
-  if (n >= 6) {
-    const p = results.slice(0, 6);
-    if (p[0]===p[1] && p[2]===p[3] && p[4]===p[5] && p[0]!==p[2] && p[2]!==p[4]) {
-      const d = p[0]==='TAI' ? -CONFIG.WEIGHTS.pattern222 : CONFIG.WEIGHTS.pattern222;
-      push('pattern222', d, 'Cầu 2-2-2');
+  /* ============================================================
+     [10] FETCH
+     ============================================================ */
+  async function fetchData() {
+    try {
+      const r = await fetch(CFG.API + '?t=' + now(), { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      if (!d.list || !d.list.length) throw new Error('Empty list');
+      S.fetches++;
+      render(d);
+    } catch (e) {
+      S.errors++;
+      const pm = $('__pm');
+      if (pm) pm.textContent = 'Lỗi: ' + e.message + ' (retry...)';
+      log('Fetch error', e.message);
     }
   }
 
-  // === Rule 4: 1-2-1-2 ===
-  if (n >= 4) {
-    const p = results.slice(0, 4);
-    if (p[0]!==p[1] && p[1]===p[2] && p[2]!==p[3]) {
-      const d = p[0]==='TAI' ? CONFIG.WEIGHTS.pattern1212 : -CONFIG.WEIGHTS.pattern1212;
-      push('pattern1212', d, 'Cầu 1-2-1-2');
-    }
+  /* ============================================================
+     [11] START
+     ============================================================ */
+  function start() {
+    loadState();
+    initUI();
+    fetchData();
+    if (S.timerFetch) clearInterval(S.timerFetch);
+    if (S.timerCd) clearInterval(S.timerCd);
+    S.cd = CFG.REFRESH_MS / 1000;
+    S.timerCd = setInterval(() => {
+      S.cd--;
+      const el = $('__cd');
+      if (el) el.textContent = S.cd;
+      if (S.cd <= 0) { S.cd = CFG.REFRESH_MS / 1000; fetchData(); }
+    }, 1000);
   }
 
-  // === Rule 5: bệt 3 ===
-  if (n >= 3) {
-    const p = results.slice(0, 3);
-    if (p[0]===p[1] && p[1]===p[2]) {
-      const d = p[0]==='TAI' ? -CONFIG.WEIGHTS.pattern3step : CONFIG.WEIGHTS.pattern3step;
-      push('pattern3step', d, 'Bệt 3');
-    }
-  }
-
-  // === Rule 6: recent trend 20 ===
-  const recent = results.slice(0, Math.min(20, n));
-  const rt = (recent.filter(r => r==='TAI').length / recent.length) - 0.5;
-  if (Math.abs(rt) > 0.1) {
-    const d = rt > 0 ? -CONFIG.WEIGHTS.recentTrend : CONFIG.WEIGHTS.recentTrend;
-    push('recentTrend', d, `20 phiên: ${((rt+0.5)*100).toFixed(0)}% TAI`);
-  }
-
-  // === Rule 7: dice bias ===
-  const r10 = list.slice(0, Math.min(10, n));
-  let td = 0, xd = 0;
-  r10.forEach(s => (s.dices || []).forEach(d => d >= 4 ? td++ : xd++));
-  if (td + xd > 0) {
-    const r = td / (td + xd);
-    if (r > 0.62) push('diceBias', -CONFIG.WEIGHTS.diceBias, `Xúc xắc thiên TAI ${(r*100).toFixed(0)}%`);
-    else if (r < 0.38) push('diceBias', CONFIG.WEIGHTS.diceBias, `Xúc xắc thiên XIU ${(r*100).toFixed(0)}%`);
-  }
-
-  // === Rule 8: point bias ===
-  const pts = r10.map(s => s.point || 0);
-  const avg = pts.reduce((a,b)=>a+b,0) / (pts.length || 1);
-  if (avg > 12) push('pointBias', -CONFIG.WEIGHTS.pointBias, `Điểm TB ${avg.toFixed(1)} cao`);
-  else if (avg < 8) push('pointBias', CONFIG.WEIGHTS.pointBias, `Điểm TB ${avg.toFixed(1)} thấp`);
-
-  // === Rule 9: bounce ===
-  if (n >= 5) {
-    let b = 0;
-    for (let i = 0; i < 4; i++) if (results[i] !== results[i+1]) b++;
-    if (b >= 3) {
-      const d = last==='TAI' ? -CONFIG.WEIGHTS.bouncePattern : CONFIG.WEIGHTS.bouncePattern;
-      push('bouncePattern', d, `Nhảy ${b}/4 phiên`);
-    }
-  }
-
-  // === Rule 10: cluster density ===
-  if (n >= 10) {
-    const cluster = results.slice(0, 10);
-    let maxRun = 1, cur = 1;
-    for (let i = 1; i < cluster.length; i++) {
-      if (cluster[i] === cluster[i-1]) { cur++; maxRun = Math.max(maxRun, cur); }
-      else cur = 1;
-    }
-    if (maxRun >= 4) {
-      const d = cluster[0]==='TAI' ? -CONFIG.WEIGHTS.clusterDensity : CONFIG.WEIGHTS.clusterDensity;
-      push('clusterDensity', d, `Cụm ${maxRun} phiên`);
-    }
-  }
-
-  // === Rule 11: alternating fade ===
-  if (n >= 8) {
-    const seg = results.slice(0, 8);
-    let alt = 0;
-    for (let i = 0; i < 7; i++) if (seg[i] !== seg[i+1]) alt++;
-    if (alt >= 6) {
-      const d = last==='TAI' ? -CONFIG.WEIGHTS.alternatingFade : CONFIG.WEIGHTS.alternatingFade;
-      push('alternatingFade', d, `Đảo ${alt}/7 phiên → bẻ mạnh`);
-    }
-  }
-
-  // === Rule 12: double break ===
-  if (n >= 4) {
-    const p = results.slice(0, 4);
-    if (p[0]!==p[1] && p[1]!==p[2] && p[2]!==p[3]) {
-      const d = p[0]==='TAI' ? CONFIG.WEIGHTS.doubleBreak : -CONFIG.WEIGHTS.doubleBreak;
-      push('doubleBreak', d, 'Đảo liên tiếp 3 phiên');
-    }
-  }
-
-  const predict = score >= 0 ? 'TAI' : 'XIU';
-  const confidence = Math.max(
-    CONFIG.MIN_CONFIDENCE,
-    Math.min(95, 50 + Math.abs(score) * 4)
+  start();
+  console.log(
+    '%c✅ VIP TXMD5 LC79 đã treo render!',
+    'color:#38ef7d;font-weight:bold;font-size:14px;text-shadow:0 0 8px #38ef7d'
   );
-
-  return {
-    score,
-    predict,
-    confidence,
-    streak,
-    last,
-    opposite,
-    tai,
-    xiu,
-    total,
-    details
-  };
-}
-
-/* ============================ PREDICTOR ============================ */
-function makePrediction() {
-  if (!Store.history.length) return;
-  const info = analyze(Store.history);
-  if (!info) return;
-  const latest = Store.history[0];
-  const nextId = latest.id + 1;
-
-  // check đã có dự đoán chưa
-  const exists = Store.predictions.find(p => p.id === nextId);
-  if (exists) return;
-
-  const pred = {
-    id: nextId,
-    predict: info.predict,
-    confidence: Math.round(info.confidence),
-    score: info.score,
-    baseId: latest.id,
-    baseResult: latest.resultTruyenThong,
-    basePoint: latest.point,
-    baseDices: latest.dices,
-    streak: info.streak,
-    tai: info.tai,
-    xiu: info.xiu,
-    details: info.details,
-    actual: null,
-    correct: null,
-    createdAt: Date.now()
-  };
-  Store.predictions.unshift(pred);
-  if (Store.predictions.length > CONFIG.MAX_PREDICTIONS) Store.predictions.pop();
-  logger.info(`Pred #${pred.id} → ${pred.predict} (${pred.confidence}%) | base=${pred.baseId} ${pred.baseResult}`);
-}
-
-/* ============================ CHECK RESULT ============================ */
-function checkPredictions() {
-  const map = {};
-  Store.history.forEach(h => map[h.id] = h);
-  let updated = 0;
-  Store.predictions.forEach(p => {
-    if (p.actual === null && map[p.id]) {
-      const real = map[p.id];
-      p.actual = real.resultTruyenThong;
-      p.actualPoint = real.point;
-      p.actualDices = real.dices;
-      p.correct = (p.actual === p.predict);
-      updated++;
-    }
-  });
-  if (updated) logger.info(`Checked ${updated} predictions`);
-}
-
-/* ============================ STATS ============================ */
-function computeStats() {
-  const resolved = Store.predictions.filter(p => p.correct !== null);
-  const ok = resolved.filter(p => p.correct).length;
-  const fail = resolved.length - ok;
-  const rate = resolved.length ? ((ok / resolved.length) * 100).toFixed(2) : '0.00';
-
-  // streak đúng/sai hiện tại
-  let winStreak = 0, loseStreak = 0;
-  for (const p of Store.predictions) {
-    if (p.correct === null) continue;
-    if (p.correct) { if (loseStreak > 0) break; winStreak++; }
-    else { if (winStreak > 0) break; loseStreak++; }
-  }
-
-  // theo confidence bucket
-  const buckets = { '55-65': { ok: 0, total: 0 }, '65-75': { ok: 0, total: 0 }, '75-85': { ok: 0, total: 0 }, '85+': { ok: 0, total: 0 } };
-  resolved.forEach(p => {
-    let k = '55-65';
-    if (p.confidence >= 85) k = '85+';
-    else if (p.confidence >= 75) k = '75-85';
-    else if (p.confidence >= 65) k = '65-75';
-    buckets[k].total++;
-    if (p.correct) buckets[k].ok++;
-  });
-
-  // 20 phiên gần
-  const last20 = resolved.slice(0, 20);
-  const ok20 = last20.filter(p => p.correct).length;
-
-  return {
-    totalPredictions: Store.predictions.length,
-    resolved: resolved.length,
-    ok, fail, rate,
-    winStreak, loseStreak,
-    last20Rate: last20.length ? ((ok20 / last20.length) * 100).toFixed(2) : '0.00',
-    buckets,
-    historySize: Store.history.length,
-    fetchCount: Store.fetchCount,
-    errorCount: Store.errorCount,
-    apiLatency: Store.apiLatency,
-    uptimeSec: Math.floor((Date.now() - Store.startTime) / 1000),
-    lastFetchAt: Store.lastFetchAt
-  };
-}
-
-/* ============================ CORE LOOP ============================ */
-async function tick() {
-  const data = await fetchSessions();
-  if (!data) return;
-  checkPredictions();
-  if (Store.lastId !== data.list[0].id) {
-    Store.lastId = data.list[0].id;
-    makePrediction();
-  }
-}
-
-/* ============================ API JSON ============================ */
-app.get('/apilc79md5', (req, res) => {
-  const latest = Store.predictions[0];
-  const stats = computeStats();
-  if (!latest) {
-    return res.json({ ok: false, message: 'Chưa có dữ liệu, vui lòng chờ...' });
-  }
-  res.json({
-    ok: true,
-    session: latest.id,
-    duDoan: latest.predict,
-    doTinCay: latest.confidence + '%',
-    score: latest.score,
-    phienGoc: latest.baseId,
-    ketQuaGoc: latest.baseResult,
-    xucXacGoc: latest.baseDices,
-    diemGoc: latest.basePoint,
-    streak: latest.streak,
-    thongKe: { TAI: latest.tai, XIU: latest.xiu },
-    details: latest.details,
-    stats,
-    createdAt: latest.createdAt
-  });
-});
-
-/* ============================ API DETAIL ============================ */
-app.get('/apilc79md5/all', (req, res) => {
-  res.json({
-    ok: true,
-    predictions: Store.predictions.slice(0, 200),
-    stats: computeStats()
-  });
-});
-
-/* ============================ API HISTORY ============================ */
-app.get('/apilc79md5/history', (req, res) => {
-  res.json({
-    ok: true,
-    history: Store.history.slice(0, 200)
-  });
-});
-
-/* ============================ HTML DASHBOARD ============================ */
-app.get('/data', (req, res) => {
-  const stats = computeStats();
-  const latest = Store.predictions[0];
-
-  const rows = Store.predictions.map(p => {
-    const cls = p.correct === true ? 'ok' : p.correct === false ? 'fail' : 'pending';
-    const mark = p.correct === null ? '⏳' : p.correct ? '✅' : '❌';
-    return `<tr class="${cls}">
-      <td>#${p.id}</td>
-      <td class="bold">${p.predict}</td>
-      <td>${p.confidence}%</td>
-      <td>${p.score > 0 ? '+' : ''}${p.score}</td>
-      <td>${p.baseResult} (${p.basePoint})</td>
-      <td>${p.actual || '...'}</td>
-      <td>${p.actualPoint || '...'}</td>
-      <td>${mark}</td>
-      <td>${p.streak}</td>
-    </tr>`;
-  }).join('');
-
-  const detailRows = latest ? latest.details.map(d =>
-    `<tr><td>${d.name}</td><td>${d.delta > 0 ? '+' : ''}${d.delta}</td><td>${d.reason}</td></tr>`
-  ).join('') : '';
-
-  const histRows = Store.history.slice(0, 50).map(h =>
-    `<tr><td>#${h.id}</td><td>${h.resultTruyenThong}</td><td>${h.point}</td><td>${(h.dices||[]).join('-')}</td></tr>`
-  ).join('');
-
-  res.send(`<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LC79 MD5 Predictor - Dashboard</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Segoe UI', Arial, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
-  h1 { color: #58a6ff; text-align: center; margin-bottom: 8px; font-size: 24px; }
-  .sub { text-align: center; color: #8b949e; margin-bottom: 20px; font-size: 13px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
-  .card .label { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .card .value { font-size: 22px; font-weight: bold; margin-top: 6px; }
-  .card.tai .value { color: #3fb950; }
-  .card.xiu .value { color: #f85149; }
-  .card.conf .value { color: #f0b400; }
-  .card.rate .value { color: #58a6ff; }
-  table { width: 100%; border-collapse: collapse; margin-bottom: 20px; background: #161b22; border-radius: 8px; overflow: hidden; }
-  th, td { padding: 8px 10px; text-align: center; border-bottom: 1px solid #21262d; font-size: 13px; }
-  th { background: #21262d; color: #8b949e; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
-  tr.ok { background: rgba(63,185,80,0.08); }
-  tr.fail { background: rgba(248,81,73,0.08); }
-  tr.pending { background: rgba(240,180,0,0.06); }
-  .bold { font-weight: bold; }
-  h2 { color: #58a6ff; margin: 20px 0 10px; font-size: 16px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
-  .badge.tai { background: #238636; color: #fff; }
-  .badge.xiu { background: #da3633; color: #fff; }
-  .footer { text-align: center; color: #484f58; font-size: 11px; margin-top: 30px; }
-  .live { display: inline-block; width: 8px; height: 8px; background: #3fb950; border-radius: 50%; animation: pulse 1.5s infinite; margin-right: 6px; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-</style>
-</head>
-<body>
-  <h1><span class="live"></span>LC79 MD5 PREDICTOR</h1>
-  <div class="sub">Dự đoán dựa 100% trên data lịch sử API gốc • Cập nhật mỗi 5 giây</div>
-
-  <div class="grid">
-    <div class="card tai">
-      <div class="label">Phiên dự đoán</div>
-      <div class="value">#${latest ? latest.id : '---'}</div>
-    </div>
-    <div class="card ${latest && latest.predict === 'TAI' ? 'tai' : 'xiu'}">
-      <div class="label">Dự đoán</div>
-      <div class="value">${latest ? latest.predict : '---'}</div>
-    </div>
-    <div class="card conf">
-      <div class="label">Độ tin cậy</div>
-      <div class="value">${latest ? latest.confidence + '%' : '---'}</div>
-    </div>
-    <div class="card rate">
-      <div class="label">Tỷ lệ đúng</div>
-      <div class="value">${stats.rate}%</div>
-    </div>
-    <div class="card">
-      <div class="label">Tổng dự đoán</div>
-      <div class="value">${stats.resolved}</div>
-    </div>
-    <div class="card">
-      <div class="label">Đúng / Sai</div>
-      <div class="value">${stats.ok} / ${stats.fail}</div>
-    </div>
-    <div class="card">
-      <div class="label">Win streak</div>
-      <div class="value">${stats.winStreak}</div>
-    </div>
-    <div class="card">
-      <div class="label">20 phiên gần</div>
-      <div class="value">${stats.last20Rate}%</div>
-    </div>
-  </div>
-
-  <h2>📊 Phân tích rule phiên hiện tại</h2>
-  <table>
-    <tr><th>Rule</th><th>Điểm</th><th>Lý do</th></tr>
-    ${detailRows || '<tr><td colspan="3">Chưa có</td></tr>'}
-  </table>
-
-  <h2>🎯 Lịch sử dự đoán (mới nhất trên cùng)</h2>
-  <table>
-    <tr>
-      <th>Phiên</th><th>Dự đoán</th><th>Tin cậy</th><th>Score</th>
-      <th>Gốc</th><th>Thực tế</th><th>Điểm</th><th>KQ</th><th>Streak</th>
-    </tr>
-    ${rows || '<tr><td colspan="9">Đang chờ data...</td></tr>'}
-  </table>
-
-  <h2>📜 50 phiên lịch sử gần nhất</h2>
-  <table>
-    <tr><th>Phiên</th><th>KQ</th><th>Điểm</th><th>Xúc xắc</th></tr>
-    ${histRows || '<tr><td colspan="4">Chưa có</td></tr>'}
-  </table>
-
-  <div class="footer">
-    Uptime: ${stats.uptimeSec}s • Fetch: ${stats.fetchCount} • Errors: ${stats.errorCount} • API: ${stats.apiLatency}ms<br>
-    Endpoint: /apilc79md5 • /apilc79md5/all • /apilc79md5/history • /data
-  </div>
-</body>
-</html>`);
-});
-
-/* ============================ ROOT ============================ */
-app.get('/', (req, res) => {
-  res.redirect('/data');
-});
-
-/* ============================ BOOT ============================ */
-cron.schedule(CONFIG.CRON, () => { tick().catch(e => logger.error(e.message)); });
-tick().catch(e => logger.error(e.message));
-
-app.listen(PORT, () => {
-  logger.info(`🚀 LC79 MD5 Predictor running on port ${PORT}`);
-  logger.info(`   → JSON:  http://localhost:${PORT}/apilc79md5`);
-  logger.info(`   → HTML:  http://localhost:${PORT}/data`);
-});
+  console.log(
+    '%c→ Panel góc phải trên · auto 5s · bấm ✕ để tắt',
+    'color:#4ecdc4;font-size:11px'
+  );
+})();
